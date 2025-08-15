@@ -7,6 +7,9 @@
 (define-constant ERR_INVALID_PARAMS (err u400))
 (define-constant ERR_NOT_OWNER (err u403))
 (define-constant ERR_TRANSFER_FAILED (err u500))
+(define-constant ERR_NOT_FOR_SALE (err u601))
+(define-constant ERR_INSUFFICIENT_PAYMENT (err u602))
+(define-constant ERR_CANNOT_BUY_OWN (err u603))
 
 (define-data-var next-token-id uint u1)
 (define-data-var contract-paused bool false)
@@ -46,6 +49,16 @@
     status: (string-ascii 20),
     timestamp: uint,
     verifier: (optional principal)
+  }
+)
+
+(define-map marketplace-listings
+  uint
+  {
+    seller: principal,
+    price: uint,
+    listed-at: uint,
+    is-active: bool
   }
 )
 
@@ -260,4 +273,73 @@
 
 (define-read-only (get-next-token-id)
   (var-get next-token-id)
+)
+
+(define-public (list-sneaker-for-sale (token-id uint) (price uint))
+  (let (
+    (current-owner (unwrap! (nft-get-owner? sneaker-nft token-id) ERR_NOT_FOUND))
+    (sneaker-info (unwrap! (map-get? sneaker-data token-id) ERR_NOT_FOUND))
+  )
+    (asserts! (not (var-get contract-paused)) ERR_NOT_AUTHORIZED)
+    (asserts! (is-eq tx-sender current-owner) ERR_NOT_OWNER)
+    (asserts! (get is-authentic sneaker-info) ERR_INVALID_PARAMS)
+    (asserts! (> price u0) ERR_INVALID_PARAMS)
+    
+    (map-set marketplace-listings token-id {
+      seller: tx-sender,
+      price: price,
+      listed-at: stacks-block-height,
+      is-active: true
+    })
+    
+    (add-history-entry token-id "LISTED" tx-sender "Listed for sale")
+    
+    (ok true)
+  )
+)
+
+(define-public (delist-sneaker (token-id uint))
+  (let (
+    (listing (unwrap! (map-get? marketplace-listings token-id) ERR_NOT_FOR_SALE))
+    (current-owner (unwrap! (nft-get-owner? sneaker-nft token-id) ERR_NOT_FOUND))
+  )
+    (asserts! (not (var-get contract-paused)) ERR_NOT_AUTHORIZED)
+    (asserts! (is-eq tx-sender current-owner) ERR_NOT_OWNER)
+    (asserts! (get is-active listing) ERR_NOT_FOR_SALE)
+    
+    (map-set marketplace-listings token-id
+      (merge listing { is-active: false })
+    )
+    
+    (add-history-entry token-id "DELISTED" tx-sender "Removed from sale")
+    
+    (ok true)
+  )
+)
+
+(define-public (buy-sneaker (token-id uint))
+  (let (
+    (listing (unwrap! (map-get? marketplace-listings token-id) ERR_NOT_FOR_SALE))
+    (current-owner (unwrap! (nft-get-owner? sneaker-nft token-id) ERR_NOT_FOUND))
+    (price (get price listing))
+  )
+    (asserts! (not (var-get contract-paused)) ERR_NOT_AUTHORIZED)
+    (asserts! (get is-active listing) ERR_NOT_FOR_SALE)
+    (asserts! (not (is-eq tx-sender current-owner)) ERR_CANNOT_BUY_OWN)
+    
+    (try! (stx-transfer? price tx-sender current-owner))
+    (try! (nft-transfer? sneaker-nft token-id current-owner tx-sender))
+    
+    (map-set marketplace-listings token-id
+      (merge listing { is-active: false })
+    )
+    
+    (add-history-entry token-id "SOLD" current-owner "Sold via marketplace")
+    
+    (ok true)
+  )
+)
+
+(define-read-only (get-marketplace-listing (token-id uint))
+  (map-get? marketplace-listings token-id)
 )
