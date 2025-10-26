@@ -15,6 +15,9 @@
 (define-constant ERR_CLAIM_EXISTS (err u703))
 (define-constant ERR_INVALID_CLAIM (err u704))
 (define-constant ERR_INSURANCE_EXPIRED (err u705))
+(define-constant ERR_INVALID_ROYALTY (err u706))
+(define-constant DEFAULT_ROYALTY_PERCENT u5)
+(define-constant MAX_ROYALTY_PERCENT u25)
 
 (define-data-var next-token-id uint u1)
 (define-data-var contract-paused bool false)
@@ -125,10 +128,24 @@
   }
 )
 
+(define-map manufacturer-royalties
+  principal
+  {
+    royalty-percent: uint,
+    total-earned: uint,
+    sales-count: uint
+  }
+)
+
 (define-public (authorize-manufacturer (manufacturer principal))
   (begin
     (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
     (map-set authorized-manufacturers manufacturer true)
+    (map-set manufacturer-royalties manufacturer {
+      royalty-percent: DEFAULT_ROYALTY_PERCENT,
+      total-earned: u0,
+      sales-count: u0
+    })
     (ok true)
   )
 )
@@ -599,14 +616,30 @@
   (let (
     (listing (unwrap! (map-get? marketplace-listings token-id) ERR_NOT_FOR_SALE))
     (current-owner (unwrap! (nft-get-owner? sneaker-nft token-id) ERR_NOT_FOUND))
+    (sneaker-info (unwrap! (map-get? sneaker-data token-id) ERR_NOT_FOUND))
     (price (get price listing))
+    (manufacturer (get manufacturer sneaker-info))
+    (royalty-info (map-get? manufacturer-royalties manufacturer))
+    (royalty-percent (default-to DEFAULT_ROYALTY_PERCENT (get royalty-percent royalty-info)))
+    (royalty-amount (/ (* price royalty-percent) u100))
+    (seller-amount (- price royalty-amount))
   )
     (asserts! (not (var-get contract-paused)) ERR_NOT_AUTHORIZED)
     (asserts! (get is-active listing) ERR_NOT_FOR_SALE)
     (asserts! (not (is-eq tx-sender current-owner)) ERR_CANNOT_BUY_OWN)
     
-    (try! (stx-transfer? price tx-sender current-owner))
+    (try! (stx-transfer? seller-amount tx-sender current-owner))
+    (try! (stx-transfer? royalty-amount tx-sender manufacturer))
     (try! (nft-transfer? sneaker-nft token-id current-owner tx-sender))
+    
+    (match royalty-info
+      info (map-set manufacturer-royalties manufacturer {
+        royalty-percent: (get royalty-percent info),
+        total-earned: (+ (get total-earned info) royalty-amount),
+        sales-count: (+ (get sales-count info) u1)
+      })
+      true
+    )
     
     (map-set marketplace-listings token-id
       (merge listing { is-active: false })
@@ -728,5 +761,57 @@
       (result (fold check-insurance-for-token (list u1 u2 u3 u4 u5) { token-id: token-id, found: false, current-block: current-block }))
     )
     (get found result)
+  )
+)
+
+(define-public (set-royalty-percent (new-percent uint))
+  (let (
+    (current-royalty (map-get? manufacturer-royalties tx-sender))
+  )
+    (asserts! (not (var-get contract-paused)) ERR_NOT_AUTHORIZED)
+    (asserts! (default-to false (map-get? authorized-manufacturers tx-sender)) ERR_NOT_AUTHORIZED)
+    (asserts! (<= new-percent MAX_ROYALTY_PERCENT) ERR_INVALID_ROYALTY)
+    
+    (match current-royalty
+      info (map-set manufacturer-royalties tx-sender
+        (merge info { royalty-percent: new-percent })
+      )
+      (map-set manufacturer-royalties tx-sender {
+        royalty-percent: new-percent,
+        total-earned: u0,
+        sales-count: u0
+      })
+    )
+    (ok new-percent)
+  )
+)
+
+(define-read-only (get-manufacturer-royalty-info (manufacturer principal))
+  (map-get? manufacturer-royalties manufacturer)
+)
+
+(define-read-only (calculate-sale-breakdown (token-id uint) (sale-price uint))
+  (let (
+    (sneaker-info (map-get? sneaker-data token-id))
+  )
+    (match sneaker-info
+      info
+      (let (
+        (manufacturer (get manufacturer info))
+        (royalty-info (map-get? manufacturer-royalties manufacturer))
+        (royalty-percent (default-to DEFAULT_ROYALTY_PERCENT (get royalty-percent royalty-info)))
+        (royalty-amount (/ (* sale-price royalty-percent) u100))
+        (seller-amount (- sale-price royalty-amount))
+      )
+        (some {
+          total-price: sale-price,
+          royalty-amount: royalty-amount,
+          seller-amount: seller-amount,
+          royalty-percent: royalty-percent,
+          manufacturer: manufacturer
+        })
+      )
+      none
+    )
   )
 )
