@@ -16,6 +16,9 @@
 (define-constant ERR_INVALID_CLAIM (err u704))
 (define-constant ERR_INSURANCE_EXPIRED (err u705))
 (define-constant ERR_INVALID_ROYALTY (err u706))
+(define-constant ERR_NOT_AVAILABLE_FOR_RENT (err u801))
+(define-constant ERR_RENTAL_ACTIVE (err u802))
+(define-constant ERR_RENTAL_NOT_EXPIRED (err u803))
 (define-constant DEFAULT_ROYALTY_PERCENT u5)
 (define-constant MAX_ROYALTY_PERCENT u25)
 
@@ -134,6 +137,31 @@
     royalty-percent: uint,
     total-earned: uint,
     sales-count: uint
+  }
+)
+
+(define-map sneaker-rentals
+  uint
+  {
+    owner: principal,
+    renter: principal,
+    daily-rate: uint,
+    start-block: uint,
+    end-block: uint,
+    deposit: uint,
+    is-active: bool
+  }
+)
+
+(define-map rental-listings
+  uint
+  {
+    owner: principal,
+    daily-rate: uint,
+    min-duration: uint,
+    max-duration: uint,
+    deposit-required: uint,
+    is-available: bool
   }
 )
 
@@ -788,6 +816,143 @@
 
 (define-read-only (get-manufacturer-royalty-info (manufacturer principal))
   (map-get? manufacturer-royalties manufacturer)
+)
+
+(define-public (list-for-rent (token-id uint) (daily-rate uint) (min-duration uint) (max-duration uint) (deposit-required uint))
+  (let (
+    (current-owner (unwrap! (nft-get-owner? sneaker-nft token-id) ERR_NOT_FOUND))
+    (sneaker-info (unwrap! (map-get? sneaker-data token-id) ERR_NOT_FOUND))
+  )
+    (asserts! (not (var-get contract-paused)) ERR_NOT_AUTHORIZED)
+    (asserts! (is-eq tx-sender current-owner) ERR_NOT_OWNER)
+    (asserts! (get is-authentic sneaker-info) ERR_INVALID_PARAMS)
+    (asserts! (> daily-rate u0) ERR_INVALID_PARAMS)
+    (asserts! (> min-duration u0) ERR_INVALID_PARAMS)
+    (asserts! (>= max-duration min-duration) ERR_INVALID_PARAMS)
+    
+    (map-set rental-listings token-id {
+      owner: tx-sender,
+      daily-rate: daily-rate,
+      min-duration: min-duration,
+      max-duration: max-duration,
+      deposit-required: deposit-required,
+      is-available: true
+    })
+    
+    (add-history-entry token-id "RENTAL_LISTED" tx-sender "Listed for rental")
+    (ok true)
+  )
+)
+
+(define-public (unlist-rental (token-id uint))
+  (let (
+    (listing (unwrap! (map-get? rental-listings token-id) ERR_NOT_AVAILABLE_FOR_RENT))
+    (current-owner (unwrap! (nft-get-owner? sneaker-nft token-id) ERR_NOT_FOUND))
+  )
+    (asserts! (not (var-get contract-paused)) ERR_NOT_AUTHORIZED)
+    (asserts! (is-eq tx-sender current-owner) ERR_NOT_OWNER)
+    
+    (map-set rental-listings token-id (merge listing { is-available: false }))
+    (add-history-entry token-id "RENTAL_UNLISTED" tx-sender "Removed from rental")
+    (ok true)
+  )
+)
+
+(define-public (rent-sneaker (token-id uint) (duration-blocks uint))
+  (let (
+    (listing (unwrap! (map-get? rental-listings token-id) ERR_NOT_AVAILABLE_FOR_RENT))
+    (current-owner (unwrap! (nft-get-owner? sneaker-nft token-id) ERR_NOT_FOUND))
+    (total-cost (+ (* (get daily-rate listing) (/ duration-blocks u144)) (get deposit-required listing)))
+  )
+    (asserts! (not (var-get contract-paused)) ERR_NOT_AUTHORIZED)
+    (asserts! (get is-available listing) ERR_NOT_AVAILABLE_FOR_RENT)
+    (asserts! (not (is-eq tx-sender current-owner)) ERR_CANNOT_BUY_OWN)
+    (asserts! (>= duration-blocks (get min-duration listing)) ERR_INVALID_PARAMS)
+    (asserts! (<= duration-blocks (get max-duration listing)) ERR_INVALID_PARAMS)
+    
+    (try! (stx-transfer? (- total-cost (get deposit-required listing)) tx-sender current-owner))
+    (try! (stx-transfer? (get deposit-required listing) tx-sender (as-contract tx-sender)))
+    
+    (map-set sneaker-rentals token-id {
+      owner: current-owner,
+      renter: tx-sender,
+      daily-rate: (get daily-rate listing),
+      start-block: stacks-block-height,
+      end-block: (+ stacks-block-height duration-blocks),
+      deposit: (get deposit-required listing),
+      is-active: true
+    })
+    
+    (map-set rental-listings token-id (merge listing { is-available: false }))
+    (add-history-entry token-id "RENTED" tx-sender "Sneaker rented")
+    (ok true)
+  )
+)
+
+(define-public (return-rental (token-id uint))
+  (let (
+    (rental (unwrap! (map-get? sneaker-rentals token-id) ERR_NOT_FOUND))
+  )
+    (asserts! (not (var-get contract-paused)) ERR_NOT_AUTHORIZED)
+    (asserts! (get is-active rental) ERR_NOT_FOUND)
+    (asserts! (or (is-eq tx-sender (get renter rental)) (is-eq tx-sender (get owner rental))) ERR_NOT_AUTHORIZED)
+    
+    (try! (as-contract (stx-transfer? (get deposit rental) tx-sender (get renter rental))))
+    
+    (map-set sneaker-rentals token-id (merge rental { is-active: false }))
+    (add-history-entry token-id "RENTAL_RETURNED" tx-sender "Sneaker returned from rental")
+    (ok true)
+  )
+)
+
+(define-public (claim-deposit (token-id uint))
+  (let (
+    (rental (unwrap! (map-get? sneaker-rentals token-id) ERR_NOT_FOUND))
+  )
+    (asserts! (not (var-get contract-paused)) ERR_NOT_AUTHORIZED)
+    (asserts! (get is-active rental) ERR_NOT_FOUND)
+    (asserts! (is-eq tx-sender (get owner rental)) ERR_NOT_AUTHORIZED)
+    (asserts! (> stacks-block-height (get end-block rental)) ERR_RENTAL_NOT_EXPIRED)
+    
+    (try! (as-contract (stx-transfer? (get deposit rental) tx-sender (get owner rental))))
+    
+    (map-set sneaker-rentals token-id (merge rental { is-active: false }))
+    (add-history-entry token-id "DEPOSIT_CLAIMED" tx-sender "Rental deposit claimed by owner")
+    (ok true)
+  )
+)
+
+(define-read-only (get-rental-listing (token-id uint))
+  (map-get? rental-listings token-id)
+)
+
+(define-read-only (get-active-rental (token-id uint))
+  (map-get? sneaker-rentals token-id)
+)
+
+(define-read-only (is-rental-active (token-id uint))
+  (match (map-get? sneaker-rentals token-id)
+    rental (and (get is-active rental) (<= stacks-block-height (get end-block rental)))
+    false
+  )
+)
+
+(define-read-only (get-rental-quote (token-id uint) (duration-blocks uint))
+  (match (map-get? rental-listings token-id)
+    listing
+    (let (
+      (rental-fee (* (get daily-rate listing) (/ duration-blocks u144)))
+    )
+      (some {
+        daily-rate: (get daily-rate listing),
+        duration-blocks: duration-blocks,
+        rental-fee: rental-fee,
+        deposit: (get deposit-required listing),
+        total-cost: (+ rental-fee (get deposit-required listing))
+      })
+    )
+    none
+  )
 )
 
 (define-read-only (calculate-sale-breakdown (token-id uint) (sale-price uint))
